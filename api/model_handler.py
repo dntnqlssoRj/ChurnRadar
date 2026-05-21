@@ -6,8 +6,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 from api.alert_fatigue import classify_risk_level
-from api.threshold_policy import resolve_churn_threshold
-from src.utils.helpers import first_existing_path, model_path, result_path
+from src.utils.helpers import first_existing_path, model_path
 
 # 로거 설정
 logger = logging.getLogger(__name__)
@@ -18,13 +17,11 @@ _TS_MODEL_PATH = first_existing_path(
     model_path("transformer_churn_v1.pth"),
 ) or model_path("churn_pro_engine.pth")
 _TCN_MODEL_PATH = model_path("churn_tcn.pth")
-_THRESHOLD_PATH = result_path("threshold_optimization_summary.json")
 
 _xgb_model: Optional[Any] = None
 _ts_model: Optional[Any] = None
 _tcn_model: Optional[Any] = None
 _tcn_checkpoint: Optional[Dict[str, Any]] = None
-_churn_threshold: Optional[float] = None
 _load_attempted_xgb = False
 _load_attempted_ts = False
 _load_attempted_tcn = False
@@ -118,27 +115,13 @@ def _get_tcn_model() -> Optional[Any]:
 def get_risk_level(probability: float) -> str:
     return classify_risk_level(probability)
 
-def get_churn_threshold() -> float:
-    global _churn_threshold
-    if _churn_threshold is None:
-        _churn_threshold = resolve_churn_threshold(_THRESHOLD_PATH)
-        logger.info(f"Churn classification threshold: {_churn_threshold:.4f}")
-    return _churn_threshold
-
 def _prepare_xgb_input(data: Dict[str, Any]) -> pd.DataFrame:
     # 파생 변수 계산
     total_subs = max(data["total_subs"], 1)  # 0으로 나누기 방지
     active_ratio = data["active_subscribers"] / total_subs
     inactive_ratio = data["not_active_subscribers"] / total_subs
-    suspended_subscribers = float(data.get("suspended_subscribers", 0.0) or 0.0)
-    suspended_ratio = suspended_subscribers / total_subs
     total_rev = data["total_revenue"] if data["total_revenue"] != 0 else 1.0
     mobile_revenue_ratio = data["avg_mobile_revenue"] / total_rev
-    revenue_per_active = data["total_revenue"] / max(data["active_subscribers"], 1)
-    inactive_x_revenue = inactive_ratio * data["total_revenue"]
-    revenue_balance = min(data["avg_mobile_revenue"], data["avg_fix_revenue"]) / (
-        max(data["avg_mobile_revenue"], data["avg_fix_revenue"]) + 1e-5
-    )
 
     # 학습 피처와 완전히 일치 (tune_xgboost.py NUMERIC_FEATURES + CAT_FEATURES 순서)
     row = {
@@ -151,10 +134,6 @@ def _prepare_xgb_input(data: Dict[str, Any]) -> pd.DataFrame:
         "Not_Active_subscribers": data["not_active_subscribers"],
         "Mobile_Revenue_Ratio":   mobile_revenue_ratio,
         "Inactive_Ratio":         inactive_ratio,
-        "Suspended_Ratio":        suspended_ratio,
-        "Revenue_per_Active_Sub": revenue_per_active,
-        "Inactive_x_Revenue":     inactive_x_revenue,
-        "Revenue_Balance":        revenue_balance,
         "CRM_PID_Value_Segment":  data["crm_segment"],
         "EffectiveSegment":       data["effective_segment"],
     }
@@ -256,8 +235,7 @@ def predict_churn(data: Dict[str, Any]) -> Dict[str, Any]:
         churn_prob = xgb_prob * 0.4 + ts_prob * 0.6  # 실제 시계열 데이터 → Transformer 위주
     else:
         churn_prob = xgb_prob * 0.8 + ts_prob * 0.2  # 시뮬레이션 데이터 → XGBoost 위주
-    prediction_threshold = get_churn_threshold()
-    is_churn = churn_prob >= prediction_threshold
+    is_churn = churn_prob >= 0.5
     
     risk_level = get_risk_level(churn_prob)
     expected_revenue_loss = data["arpu"] if is_churn else 0.0
@@ -267,7 +245,6 @@ def predict_churn(data: Dict[str, Any]) -> Dict[str, Any]:
         "tcn_probability": tcn_prob,
         "ts_probability": ts_prob,
         "churn_probability": churn_prob,
-        "prediction_threshold": prediction_threshold,
         "churn_prediction": is_churn,
         "risk_level": risk_level,
         "expected_revenue_loss": expected_revenue_loss
